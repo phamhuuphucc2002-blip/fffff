@@ -22,7 +22,10 @@ const app = express();
 
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
-app.use(helmet({ crossOriginResourcePolicy: false }));
+// Arcanum is a single-file HTML app with inline scripts/styles. Helmet's default
+// CSP blocks those scripts, which makes the page visible but all buttons inert.
+// Keep Helmet's other protections while disabling only its CSP for this app.
+app.use(helmet({ crossOriginResourcePolicy: false, contentSecurityPolicy: false }));
 app.use(cors({ origin: CORS_ORIGIN || true }));
 app.use(express.json({ limit: '15mb' }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, limit: 600, standardHeaders: true, legacyHeaders: false }));
