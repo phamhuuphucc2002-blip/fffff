@@ -18,13 +18,13 @@ const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
 const CORS_ORIGIN = String(process.env.CORS_ORIGIN || '').trim();
 const DATA_DIR = process.env.ARCANUM_DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'arcanum.json');
+const ALLOW_FILE_STORAGE = String(process.env.ALLOW_FILE_STORAGE || 'true').toLowerCase() === 'true';
 const app = express();
 
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
-// Arcanum is a single-file HTML app with inline scripts/styles. Helmet's default
-// CSP blocks those scripts, which makes the page visible but all buttons inert.
-// Keep Helmet's other protections while disabling only its CSP for this app.
+// The Arcanum UI contains inline scripts/styles, so keep Helmet protections
+// while disabling only its CSP for this single-file application.
 app.use(helmet({ crossOriginResourcePolicy: false, contentSecurityPolicy: false }));
 app.use(cors({ origin: CORS_ORIGIN || true }));
 app.use(express.json({ limit: '15mb' }));
@@ -33,7 +33,7 @@ app.use(rateLimit({ windowMs: 15 * 60 * 1000, limit: 600, standardHeaders: true,
 let pool = null;
 let storage = 'file';
 
-const emptyDb = () => ({ users: [], workspaces: [], memberships: [] });
+const emptyDb = () => ({ users: [], workspaces: [], memberships: [], contributions: [], revisions: [] });
 
 function ensureFileDb() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -47,7 +47,7 @@ function readFileDb() {
 function writeFileDb(db) {
   ensureFileDb();
   const tmp = DATA_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(db), 'utf8');
   fs.renameSync(tmp, DATA_FILE);
 }
 
@@ -55,238 +55,138 @@ const uid = p => p + '_' + crypto.randomBytes(10).toString('hex');
 const joinCode = () => 'ARC-' + crypto.randomBytes(4).toString('hex').toUpperCase();
 const normalizeEmail = x => String(x || '').trim().toLowerCase();
 const cleanData = x => ({ version: 3, entries: Array.isArray(x?.entries) ? x.entries : [], notes: Array.isArray(x?.notes) ? x.notes : [] });
+const CONTRIBUTOR_COLORS = ['#4F8EF7','#8B5CF6','#10B981','#F59E0B','#EF4444','#06B6D4','#EC4899','#84CC16'];
+const contributionColor = index => CONTRIBUTOR_COLORS[Math.abs(Number(index) || 0) % CONTRIBUTOR_COLORS.length];
 
-function hashPassword(password) {
-  return bcrypt.hash(String(password), 12);
-}
-function tokenFor(userId) {
-  return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: '30d' });
-}
+function hashPassword(password) { return bcrypt.hash(String(password), 12); }
+function tokenFor(userId) { return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: '30d' }); }
 function auth(req, res, next) {
   const h = req.headers.authorization || '';
   if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'Chưa đăng nhập' });
-  try {
-    const p = jwt.verify(h.slice(7), JWT_SECRET);
-    req.userId = p.sub;
-    next();
-  } catch {
-    return res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn' });
-  }
+  try { req.userId = jwt.verify(h.slice(7), JWT_SECRET).sub; next(); }
+  catch { return res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn' }); }
 }
 
 async function initStorage() {
   if (!DATABASE_URL) {
-    storage = 'file';
-    ensureFileDb();
-    return;
+    if (!ALLOW_FILE_STORAGE) throw new Error('DATABASE_URL is required in production');
+    storage = 'file'; ensureFileDb(); return;
   }
   try {
-    pool = new Pool({
-      connectionString: DATABASE_URL,
-      ssl: process.env.PGSSL === 'require' ? { rejectUnauthorized: false } : undefined,
-      max: 5,
-      idleTimeoutMillis: 10000,
-      connectionTimeoutMillis: 5000
-    });
+    pool = new Pool({ connectionString: DATABASE_URL, ssl: process.env.PGSSL === 'require' ? { rejectUnauthorized: false } : undefined, max: 5, idleTimeoutMillis: 10000, connectionTimeoutMillis: 5000 });
     await pool.query('SELECT 1');
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS arcanum_users (
-        id TEXT PRIMARY KEY,
-        email TEXT UNIQUE NOT NULL,
-        name TEXT NOT NULL,
-        password_hash TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS arcanum_workspaces (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        join_code TEXT UNIQUE NOT NULL,
-        version BIGINT NOT NULL DEFAULT 0,
-        data JSONB NOT NULL DEFAULT '{"version":3,"entries":[],"notes":[]}'::jsonb,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS arcanum_memberships (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL REFERENCES arcanum_users(id) ON DELETE CASCADE,
-        workspace_id TEXT NOT NULL REFERENCES arcanum_workspaces(id) ON DELETE CASCADE,
-        role TEXT NOT NULL DEFAULT 'member',
-        UNIQUE(user_id, workspace_id)
-      );
+      CREATE TABLE IF NOT EXISTS arcanum_users (id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,name TEXT NOT NULL,password_hash TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS arcanum_workspaces (id TEXT PRIMARY KEY,name TEXT NOT NULL,join_code TEXT UNIQUE NOT NULL,version BIGINT NOT NULL DEFAULT 0,data JSONB NOT NULL DEFAULT '{"version":3,"entries":[],"notes":[]}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS arcanum_memberships (id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES arcanum_users(id) ON DELETE CASCADE,workspace_id TEXT NOT NULL REFERENCES arcanum_workspaces(id) ON DELETE CASCADE,role TEXT NOT NULL DEFAULT 'member',UNIQUE(user_id,workspace_id));
+      CREATE TABLE IF NOT EXISTS arcanum_contributions (id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL REFERENCES arcanum_workspaces(id) ON DELETE CASCADE,entry_id TEXT,author_id TEXT NOT NULL REFERENCES arcanum_users(id) ON DELETE CASCADE,author_name TEXT NOT NULL,color TEXT NOT NULL,type TEXT NOT NULL DEFAULT 'suggestion',status TEXT NOT NULL DEFAULT 'pending',text TEXT NOT NULL,base_version BIGINT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),resolved_at TIMESTAMPTZ,resolved_by TEXT REFERENCES arcanum_users(id) ON DELETE SET NULL);
+      CREATE TABLE IF NOT EXISTS arcanum_revisions (id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL REFERENCES arcanum_workspaces(id) ON DELETE CASCADE,version BIGINT NOT NULL,author_id TEXT NOT NULL REFERENCES arcanum_users(id) ON DELETE CASCADE,author_name TEXT NOT NULL,data JSONB NOT NULL,reason TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(workspace_id,version));
       CREATE INDEX IF NOT EXISTS idx_arcanum_memberships_user ON arcanum_memberships(user_id);
+      CREATE INDEX IF NOT EXISTS idx_arcanum_contributions_workspace ON arcanum_contributions(workspace_id,status);
+      CREATE INDEX IF NOT EXISTS idx_arcanum_revisions_workspace ON arcanum_revisions(workspace_id,version DESC);
     `);
     storage = 'postgres';
   } catch (e) {
-    console.error('PostgreSQL unavailable; switching to file storage:', e.message);
+    console.error('PostgreSQL unavailable:', e.message);
     try { await pool?.end(); } catch {}
     pool = null;
-    storage = 'file';
-    ensureFileDb();
+    if (!ALLOW_FILE_STORAGE) throw new Error('Cloud database unavailable; refusing silent file fallback');
+    storage = 'file'; ensureFileDb();
   }
 }
 
 async function getUser(id) {
-  if (storage === 'postgres') return (await pool.query('SELECT id,email,name FROM arcanum_users WHERE id=$1', [id])).rows[0] || null;
-  const db = readFileDb(); const u = db.users.find(x => x.id === id);
-  return u ? { id: u.id, email: u.email, name: u.name } : null;
+  if (storage === 'postgres') return (await pool.query('SELECT id,email,name FROM arcanum_users WHERE id=$1',[id])).rows[0] || null;
+  const u = readFileDb().users.find(x => x.id === id); return u ? {id:u.id,email:u.email,name:u.name} : null;
 }
 async function getWorkspaces(userId) {
   if (storage === 'postgres') {
-    const r = await pool.query(`
-      SELECT w.id,w.name,w.join_code,w.version,m.role
-      FROM arcanum_workspaces w JOIN arcanum_memberships m ON m.workspace_id=w.id
-      WHERE m.user_id=$1 ORDER BY w.created_at
-    `, [userId]);
-    return r.rows.map(x => ({ id:x.id, name:x.name, join_code:x.join_code, version:Number(x.version), role:x.role }));
+    const r = await pool.query('SELECT w.id,w.name,w.join_code,w.version,m.role FROM arcanum_workspaces w JOIN arcanum_memberships m ON m.workspace_id=w.id WHERE m.user_id=$1 ORDER BY w.created_at',[userId]);
+    return r.rows.map(x => ({id:x.id,name:x.name,join_code:x.join_code,version:Number(x.version),role:x.role}));
   }
-  const db = readFileDb();
-  return db.memberships.filter(m => m.userId === userId).map(m => {
-    const w = db.workspaces.find(x => x.id === m.workspaceId);
-    return w ? { id:w.id, name:w.name, join_code:w.joinCode, version:w.version, role:m.role } : null;
-  }).filter(Boolean);
+  const db=readFileDb(); return db.memberships.filter(m=>m.userId===userId).map(m=>{const w=db.workspaces.find(x=>x.id===m.workspaceId);return w?{id:w.id,name:w.name,join_code:w.joinCode,version:w.version,role:m.role}:null}).filter(Boolean);
 }
-async function accountPayload(userId, workspaceId = null) {
-  const user = await getUser(userId);
-  if (!user) return null;
-  const workspaces = await getWorkspaces(userId);
-  const workspace = workspaces.find(w => w.id === workspaceId) || workspaces[0] || null;
-  return { user, workspaces, workspace };
+async function accountPayload(userId,workspaceId=null){const user=await getUser(userId);if(!user)return null;const workspaces=await getWorkspaces(userId);const workspace=workspaces.find(w=>w.id===workspaceId)||workspaces[0]||null;return{user,workspaces,workspace};}
+async function createWorkspace(userId,name){
+  const w={id:uid('ws'),name:name||'Arcanum Library',joinCode:joinCode(),version:0,data:cleanData(null)};
+  if(storage==='postgres'){
+    await pool.query('BEGIN');try{await pool.query('INSERT INTO arcanum_workspaces(id,name,join_code,data) VALUES($1,$2,$3,$4::jsonb)',[w.id,w.name,w.joinCode,JSON.stringify(w.data)]);await pool.query("INSERT INTO arcanum_memberships(id,user_id,workspace_id,role) VALUES($1,$2,$3,'owner')",[uid('mem'),userId,w.id]);await pool.query('COMMIT');}catch(e){await pool.query('ROLLBACK');throw e;}
+  }else{const db=readFileDb();db.workspaces.push(w);db.memberships.push({id:uid('mem'),userId,workspaceId:w.id,role:'owner'});writeFileDb(db);}
+  return{id:w.id,name:w.name,join_code:w.joinCode,version:0,role:'owner'};
 }
-async function createWorkspace(userId, name) {
-  const w = { id:uid('ws'), name:name || 'Arcanum Library', joinCode:joinCode(), version:0, data:cleanData(null) };
-  if (storage === 'postgres') {
-    await pool.query('BEGIN');
-    try {
-      await pool.query('INSERT INTO arcanum_workspaces(id,name,join_code,data) VALUES($1,$2,$3,$4::jsonb)', [w.id,w.name,w.joinCode,JSON.stringify(w.data)]);
-      await pool.query("INSERT INTO arcanum_memberships(id,user_id,workspace_id,role) VALUES($1,$2,$3,'owner')", [uid('mem'),userId,w.id]);
-      await pool.query('COMMIT');
-    } catch (e) { await pool.query('ROLLBACK'); throw e; }
-  } else {
-    const db = readFileDb();
-    db.workspaces.push(w);
-    db.memberships.push({ id:uid('mem'), userId, workspaceId:w.id, role:'owner' });
-    writeFileDb(db);
-  }
-  return { id:w.id, name:w.name, join_code:w.joinCode, version:0, role:'owner' };
+async function member(userId,workspaceId){if(storage==='postgres')return(await pool.query('SELECT role FROM arcanum_memberships WHERE user_id=$1 AND workspace_id=$2',[userId,workspaceId])).rows[0]||null;return readFileDb().memberships.find(m=>m.userId===userId&&m.workspaceId===workspaceId)||null;}
+async function workspace(workspaceId){if(storage==='postgres'){const r=(await pool.query('SELECT id,name,join_code,version,data FROM arcanum_workspaces WHERE id=$1',[workspaceId])).rows[0];return r?{id:r.id,name:r.name,join_code:r.join_code,version:Number(r.version),data:cleanData(r.data)}:null;}return readFileDb().workspaces.find(w=>w.id===workspaceId)||null;}
+async function register(email,password,name){
+  if(storage==='postgres'){if((await pool.query('SELECT 1 FROM arcanum_users WHERE email=$1',[email])).rowCount)throw Object.assign(new Error('Email đã tồn tại'),{status:409});const id=uid('usr');await pool.query('INSERT INTO arcanum_users(id,email,name,password_hash) VALUES($1,$2,$3,$4)',[id,email,name,await hashPassword(password)]);const ws=await createWorkspace(id,'Arcanum Library');return{id,ws};}
+  const db=readFileDb();if(db.users.some(u=>u.email===email))throw Object.assign(new Error('Email đã tồn tại'),{status:409});const id=uid('usr');db.users.push({id,email,name,passwordHash:await hashPassword(password),createdAt:new Date().toISOString()});writeFileDb(db);const ws=await createWorkspace(id,'Arcanum Library');return{id,ws};
 }
-async function member(userId, workspaceId) {
-  if (storage === 'postgres') return (await pool.query('SELECT role FROM arcanum_memberships WHERE user_id=$1 AND workspace_id=$2', [userId,workspaceId])).rows[0] || null;
-  const db = readFileDb(); return db.memberships.find(m => m.userId === userId && m.workspaceId === workspaceId) || null;
-}
-async function workspace(workspaceId) {
-  if (storage === 'postgres') {
-    const r = (await pool.query('SELECT id,name,join_code,version,data FROM arcanum_workspaces WHERE id=$1', [workspaceId])).rows[0];
-    return r ? { id:r.id,name:r.name,join_code:r.join_code,version:Number(r.version),data:cleanData(r.data) } : null;
-  }
-  const db = readFileDb(); return db.workspaces.find(w => w.id === workspaceId) || null;
-}
-async function register(email, password, name) {
-  if (storage === 'postgres') {
-    if ((await pool.query('SELECT 1 FROM arcanum_users WHERE email=$1',[email])).rowCount) throw Object.assign(new Error('Email đã tồn tại'), { status:409 });
-    const id = uid('usr');
-    await pool.query('INSERT INTO arcanum_users(id,email,name,password_hash) VALUES($1,$2,$3,$4)', [id,email,name,await hashPassword(password)]);
-    const ws = await createWorkspace(id, 'Arcanum Library');
-    return { id, ws };
-  }
-  const db = readFileDb();
-  if (db.users.some(u => u.email === email)) throw Object.assign(new Error('Email đã tồn tại'), { status:409 });
-  const id = uid('usr');
-  db.users.push({ id,email,name,passwordHash:await hashPassword(password),createdAt:new Date().toISOString() });
-  writeFileDb(db);
-  const ws = await createWorkspace(id, 'Arcanum Library');
-  return { id, ws };
-}
-async function findLoginUser(email) {
-  if (storage === 'postgres') return (await pool.query('SELECT id,email,name,password_hash FROM arcanum_users WHERE email=$1',[email])).rows[0] || null;
-  const db = readFileDb(); const u = db.users.find(x => x.email === email);
-  return u ? { id:u.id,email:u.email,name:u.name,password_hash:u.passwordHash } : null;
-}
+async function findLoginUser(email){if(storage==='postgres')return(await pool.query('SELECT id,email,name,password_hash FROM arcanum_users WHERE email=$1',[email])).rows[0]||null;const u=readFileDb().users.find(x=>x.email===email);return u?{id:u.id,email:u.email,name:u.name,password_hash:u.passwordHash}:null;}
 
-app.get('/api/health', async (_req,res) => {
-  let db = false;
-  if (storage === 'postgres') { try { await pool.query('SELECT 1'); db = true; } catch {} }
-  res.json({ ok:true, app:'Arcanum Cloud', version:'5.0.0', storage, databaseConfigured:!!DATABASE_URL, databaseReachable:db, time:new Date().toISOString() });
-});
-app.get('/health', (_req,res) => res.json({ ok:true, app:'Arcanum Cloud', storage }));
+function canEdit(role){return ['owner','admin','editor','member'].includes(role);}
+function canModerate(role){return ['owner','admin'].includes(role);}
 
-app.post('/api/auth/register', async (req,res) => {
-  try {
-    const email=normalizeEmail(req.body.email), password=String(req.body.password||''), name=(String(req.body.name||'').trim()||email.split('@')[0]).slice(0,100);
-    if (!email.includes('@')) return res.status(400).json({error:'Email không hợp lệ'});
-    if (password.length < 8) return res.status(400).json({error:'Mật khẩu phải có ít nhất 8 ký tự'});
-    const r=await register(email,password,name);
-    const p=await accountPayload(r.id,r.ws.id);
-    res.status(201).json({ token:tokenFor(r.id), ...p });
-  } catch(e) { console.error(e); res.status(e.status||500).json({error:e.message||'Không thể tạo tài khoản'}); }
-});
+app.get('/api/health',async(_req,res)=>{let reachable=false;if(storage==='postgres'){try{await pool.query('SELECT 1');reachable=true;}catch{}}res.json({ok:true,app:'Arcanum Cloud',version:'6.0.0',storage,databaseConfigured:!!DATABASE_URL,databaseReachable:reachable,cloudReady:storage==='postgres'&&reachable,time:new Date().toISOString()});});
+app.get('/health',(_req,res)=>res.json({ok:true,app:'Arcanum Cloud',storage}));
 
-app.post('/api/auth/login', async (req,res) => {
-  try {
-    const email=normalizeEmail(req.body.email), password=String(req.body.password||'');
-    const u=await findLoginUser(email);
-    if (!u || !(await bcrypt.compare(password,u.password_hash))) return res.status(401).json({error:'Email hoặc mật khẩu không đúng'});
-    const p=await accountPayload(u.id);
-    res.json({ token:tokenFor(u.id), ...p });
-  } catch(e) { console.error(e); res.status(500).json({error:'Không thể đăng nhập'}); }
-});
+app.post('/api/auth/register',async(req,res)=>{try{const email=normalizeEmail(req.body.email),password=String(req.body.password||''),name=(String(req.body.name||'').trim()||email.split('@')[0]).slice(0,100);if(!email.includes('@'))return res.status(400).json({error:'Email không hợp lệ'});if(password.length<8)return res.status(400).json({error:'Mật khẩu phải có ít nhất 8 ký tự'});const r=await register(email,password,name);const p=await accountPayload(r.id,r.ws.id);res.status(201).json({token:tokenFor(r.id),...p});}catch(e){console.error(e);res.status(e.status||500).json({error:e.message||'Không thể tạo tài khoản'});}});
+app.post('/api/auth/login',async(req,res)=>{try{const email=normalizeEmail(req.body.email),password=String(req.body.password||'');const u=await findLoginUser(email);if(!u||!(await bcrypt.compare(password,u.password_hash)))return res.status(401).json({error:'Email hoặc mật khẩu không đúng'});const p=await accountPayload(u.id);res.json({token:tokenFor(u.id),...p});}catch(e){console.error(e);res.status(500).json({error:'Không thể đăng nhập'});}});
+app.get('/api/auth/me',auth,async(req,res)=>{const p=await accountPayload(req.userId);if(!p)return res.status(401).json({error:'Tài khoản không tồn tại'});res.json(p);});
 
-app.get('/api/auth/me', auth, async (req,res) => {
-  const p=await accountPayload(req.userId);
-  if (!p) return res.status(401).json({error:'Tài khoản không tồn tại'});
-  res.json(p);
-});
+app.post('/api/workspaces',auth,async(req,res)=>{try{const w=await createWorkspace(req.userId,String(req.body.name||'').trim()||'Arcanum Library');res.status(201).json(await accountPayload(req.userId,w.id));}catch(e){console.error(e);res.status(500).json({error:'Không thể tạo workspace'});}});
+app.post('/api/workspaces/join',auth,async(req,res)=>{try{const code=String(req.body.joinCode||'').trim().toUpperCase();let w=null;if(storage==='postgres')w=(await pool.query('SELECT id FROM arcanum_workspaces WHERE join_code=$1',[code])).rows[0]||null;else{const db=readFileDb();w=db.workspaces.find(x=>x.joinCode===code)||null;}if(!w)return res.status(404).json({error:'Không tìm thấy workspace với mã này'});if(!(await member(req.userId,w.id))){if(storage==='postgres')await pool.query("INSERT INTO arcanum_memberships(id,user_id,workspace_id,role) VALUES($1,$2,$3,'member')",[uid('mem'),req.userId,w.id]);else{const db=readFileDb();db.memberships.push({id:uid('mem'),userId:req.userId,workspaceId:w.id,role:'member'});writeFileDb(db);}}res.json(await accountPayload(req.userId,w.id));}catch(e){console.error(e);res.status(500).json({error:'Không thể tham gia workspace'});}});
 
-app.post('/api/workspaces', auth, async (req,res) => {
-  try {
-    const w=await createWorkspace(req.userId,String(req.body.name||'').trim()||'Arcanum Library');
-    const p=await accountPayload(req.userId,w.id);
-    res.status(201).json(p);
-  } catch(e) { console.error(e); res.status(500).json({error:'Không thể tạo workspace'}); }
-});
+app.get('/api/workspaces/:id/data',auth,async(req,res)=>{try{const m=await member(req.userId,req.params.id);if(!m)return res.status(403).json({error:'Bạn chưa tham gia workspace này'});const w=await workspace(req.params.id);if(!w)return res.status(404).json({error:'Workspace không tồn tại'});res.json({workspace:{id:w.id,name:w.name,join_code:w.join_code||w.joinCode,role:m.role,version:Number(w.version||0)},version:Number(w.version||0),data:cleanData(w.data)});}catch(e){console.error(e);res.status(500).json({error:'Không thể lấy dữ liệu cloud'});}});
 
-app.post('/api/workspaces/join', auth, async (req,res) => {
-  try {
-    const code=String(req.body.joinCode||'').trim().toUpperCase();
-    let w=null;
-    if (storage==='postgres') w=(await pool.query('SELECT id FROM arcanum_workspaces WHERE join_code=$1',[code])).rows[0]||null;
-    else { const db=readFileDb(); w=db.workspaces.find(x=>x.joinCode===code)||null; }
-    if (!w) return res.status(404).json({error:'Không tìm thấy workspace với mã này'});
-    if (!(await member(req.userId,w.id))) {
-      if (storage==='postgres') await pool.query("INSERT INTO arcanum_memberships(id,user_id,workspace_id,role) VALUES($1,$2,$3,'member')",[uid('mem'),req.userId,w.id]);
-      else { const db=readFileDb(); db.memberships.push({id:uid('mem'),userId:req.userId,workspaceId:w.id,role:'member'}); writeFileDb(db); }
-    }
-    res.json(await accountPayload(req.userId,w.id));
-  } catch(e) { console.error(e); res.status(500).json({error:'Không thể tham gia workspace'}); }
-});
-
-app.get('/api/workspaces/:id/data', auth, async (req,res) => {
-  try {
-    const m=await member(req.userId,req.params.id); if(!m) return res.status(403).json({error:'Bạn chưa tham gia workspace này'});
-    const w=await workspace(req.params.id); if(!w) return res.status(404).json({error:'Workspace không tồn tại'});
-    res.json({workspace:{id:w.id,name:w.name,join_code:w.join_code||w.joinCode,role:m.role,version:Number(w.version||0)},version:Number(w.version||0),data:cleanData(w.data)});
-  } catch(e) { console.error(e); res.status(500).json({error:'Không thể lấy dữ liệu cloud'}); }
-});
-
-app.put('/api/workspaces/:id/data', auth, async (req,res) => {
-  try {
-    const m=await member(req.userId,req.params.id); if(!m) return res.status(403).json({error:'Bạn chưa tham gia workspace này'});
-    if(!['owner','member','editor'].includes(m.role)) return res.status(403).json({error:'Bạn không có quyền chỉnh sửa'});
-    const w=await workspace(req.params.id); if(!w) return res.status(404).json({error:'Workspace không tồn tại'});
-    const base=Number(req.body.baseVersion);
-    if(!Number.isInteger(base) || base!==Number(w.version||0)) return res.status(409).json({error:'Workspace đã được cập nhật. Hãy lấy dữ liệu cloud trước.',version:Number(w.version||0),data:cleanData(w.data)});
+// Atomic optimistic-concurrency write: only the client holding the current
+// version can commit. A concurrent stale write receives 409 and never overwrites.
+app.put('/api/workspaces/:id/data',auth,async(req,res)=>{
+  try{
+    const m=await member(req.userId,req.params.id);if(!m)return res.status(403).json({error:'Bạn chưa tham gia workspace này'});if(!canEdit(m.role))return res.status(403).json({error:'Bạn không có quyền chỉnh sửa'});
+    const w=await workspace(req.params.id);if(!w)return res.status(404).json({error:'Workspace không tồn tại'});
+    const base=Number(req.body.baseVersion);if(!Number.isInteger(base))return res.status(400).json({error:'baseVersion không hợp lệ'});
     const next=cleanData(req.body.data);
-    if(storage==='postgres') await pool.query('UPDATE arcanum_workspaces SET data=$1::jsonb,version=version+1 WHERE id=$2',[JSON.stringify(next),w.id]);
-    else { const db=readFileDb(); const fw=db.workspaces.find(x=>x.id===w.id); fw.data=next; fw.version=Number(fw.version||0)+1; writeFileDb(db); }
-    const nw=await workspace(w.id);
-    res.json({workspace:{id:nw.id,name:nw.name,join_code:nw.join_code||nw.joinCode,role:m.role,version:Number(nw.version)},version:Number(nw.version),data:cleanData(nw.data)});
-  } catch(e) { console.error(e); res.status(500).json({error:'Không thể ghi dữ liệu cloud'}); }
+    if(storage==='postgres'){
+      const client=await pool.connect();try{await client.query('BEGIN');const updated=await client.query('UPDATE arcanum_workspaces SET data=$1::jsonb,version=version+1 WHERE id=$2 AND version=$3 RETURNING version,data',[JSON.stringify(next),w.id,base]);if(!updated.rowCount){await client.query('ROLLBACK');const current=await workspace(w.id);return res.status(409).json({error:'Workspace đã được cập nhật. Hãy lấy dữ liệu cloud trước.',version:Number(current?.version||0),data:cleanData(current?.data)});}const newVersion=Number(updated.rows[0].version);await client.query('INSERT INTO arcanum_revisions(id,workspace_id,version,author_id,author_name,data,reason) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)',[uid('rev'),w.id,newVersion,req.userId,(await getUser(req.userId)).name,JSON.stringify(next),'cloud-save']);await client.query('COMMIT');return res.json({workspace:{id:w.id,name:w.name,join_code:w.join_code,role:m.role,version:newVersion},version:newVersion,data:cleanData(updated.rows[0].data)});}catch(e){try{await client.query('ROLLBACK');}catch{}throw e;}finally{client.release();}
+    }
+    const db=readFileDb();const fw=db.workspaces.find(x=>x.id===w.id);if(Number(fw.version||0)!==base)return res.status(409).json({error:'Workspace đã được cập nhật. Hãy lấy dữ liệu cloud trước.',version:Number(fw.version||0),data:cleanData(fw.data)});fw.data=next;fw.version=Number(fw.version||0)+1;db.revisions=db.revisions||[];db.revisions.push({id:uid('rev'),workspaceId:w.id,version:fw.version,authorId:req.userId,authorName:(await getUser(req.userId)).name,data:next,reason:'cloud-save',createdAt:new Date().toISOString()});writeFileDb(db);return res.json({workspace:{id:fw.id,name:fw.name,join_code:fw.joinCode,role:m.role,version:fw.version},version:fw.version,data:next});
+  }catch(e){console.error(e);res.status(500).json({error:'Không thể ghi dữ liệu cloud'});}
 });
 
-app.use((_req,res) => {
-  const file=path.join(__dirname,'Arcanum_CloudSync.html');
-  if(!fs.existsSync(file)) return res.status(404).send('Arcanum UI not found');
-  res.type('html').send(fs.readFileSync(file,'utf8'));
+// Collaboration: contributors create separate suggestions instead of overwriting main content.
+app.post('/api/workspaces/:id/contributions',auth,async(req,res)=>{
+  try{
+    const m=await member(req.userId,req.params.id);if(!m)return res.status(403).json({error:'Bạn chưa tham gia workspace này'});if(!canEdit(m.role))return res.status(403).json({error:'Bạn không có quyền đóng góp'});
+    const text=String(req.body.text||'').trim();if(!text)return res.status(400).json({error:'Nội dung đóng góp không được trống'});
+    const w=await workspace(req.params.id);if(!w)return res.status(404).json({error:'Workspace không tồn tại'});
+    const user=await getUser(req.userId);const entryId=req.body.entryId?String(req.body.entryId):null;const type=['suggestion','addition','edit'].includes(req.body.type)?req.body.type:'suggestion';
+    if(storage==='postgres'){
+      const count=await pool.query('SELECT COUNT(DISTINCT author_id)::int AS n FROM arcanum_contributions WHERE workspace_id=$1',[w.id]);const color=contributionColor(count.rows[0].n);
+      const c={id:uid('con'),workspaceId:w.id,entryId,authorId:req.userId,authorName:user.name,color,type,status:'pending',text,baseVersion:Number(w.version),createdAt:new Date().toISOString()};
+      await pool.query('INSERT INTO arcanum_contributions(id,workspace_id,entry_id,author_id,author_name,color,type,status,text,base_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',[c.id,w.id,entryId,req.userId,user.name,color,type,'pending',text,Number(w.version)]);return res.status(201).json(c);
+    }
+    const db=readFileDb();db.contributions=db.contributions||[];const color=contributionColor(new Set(db.contributions.filter(c=>c.workspaceId===w.id).map(c=>c.authorId)).size);const c={id:uid('con'),workspaceId:w.id,entryId,authorId:req.userId,authorName:user.name,color,type,status:'pending',text,baseVersion:Number(w.version),createdAt:new Date().toISOString(),resolvedAt:null,resolvedBy:null};db.contributions.push(c);writeFileDb(db);res.status(201).json(c);
+  }catch(e){console.error(e);res.status(500).json({error:'Không thể tạo đề xuất'});}
 });
 
-initStorage()
-  .then(() => app.listen(PORT,'0.0.0.0',() => console.log(`Arcanum Cloud running on 0.0.0.0:${PORT} storage=${storage}`)))
-  .catch(e => { console.error('Startup failure:',e); process.exit(1); });
+app.get('/api/workspaces/:id/contributions',auth,async(req,res)=>{
+  try{const m=await member(req.userId,req.params.id);if(!m)return res.status(403).json({error:'Bạn chưa tham gia workspace này'});if(storage==='postgres'){const r=await pool.query('SELECT id,workspace_id AS "workspaceId",entry_id AS "entryId",author_id AS "authorId",author_name AS "authorName",color,type,status,text,base_version AS "baseVersion",created_at AS "createdAt",resolved_at AS "resolvedAt",resolved_by AS "resolvedBy" FROM arcanum_contributions WHERE workspace_id=$1 ORDER BY created_at DESC',[req.params.id]);return res.json({contributions:r.rows});}const db=readFileDb();res.json({contributions:(db.contributions||[]).filter(c=>c.workspaceId===req.params.id).sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt)))});}catch(e){console.error(e);res.status(500).json({error:'Không thể lấy đề xuất'});}
+});
+
+app.post('/api/workspaces/:id/contributions/:contributionId/resolve',auth,async(req,res)=>{
+  try{
+    const m=await member(req.userId,req.params.id);if(!m)return res.status(403).json({error:'Bạn chưa tham gia workspace này'});if(!canModerate(m.role))return res.status(403).json({error:'Chỉ Owner/Admin được duyệt đề xuất'});
+    const approved=req.body.approved===true;const user=await getUser(req.userId);
+    if(storage==='postgres'){
+      const client=await pool.connect();try{await client.query('BEGIN');const c=(await client.query('SELECT * FROM arcanum_contributions WHERE id=$1 AND workspace_id=$2 FOR UPDATE',[req.params.contributionId,req.params.id])).rows[0];if(!c){await client.query('ROLLBACK');return res.status(404).json({error:'Không tìm thấy đề xuất'});}if(c.status!=='pending'){await client.query('ROLLBACK');return res.status(409).json({error:'Đề xuất đã được xử lý'});}let revision=null;if(approved){const w=(await client.query('SELECT id,name,join_code,version,data FROM arcanum_workspaces WHERE id=$1 FOR UPDATE',[req.params.id])).rows[0];const data=cleanData(w.data);const contribution={id:c.id,authorId:c.author_id,authorName:c.author_name,color:c.color,type:c.type,text:c.text,entryId:c.entry_id};data.notes=[...data.notes,{id:uid('contrib'),kind:'contribution',entryId:contribution.entryId,text:contribution.text,authorId:contribution.authorId,authorName:contribution.authorName,color:contribution.color,approvedAt:new Date().toISOString()}];const nv=Number(w.version)+1;await client.query('UPDATE arcanum_workspaces SET data=$1::jsonb,version=$2 WHERE id=$3',[JSON.stringify(data),nv,w.id]);revision={id:uid('rev'),workspace_id:w.id,version:nv,author_id:req.userId,author_name:user.name,data:JSON.stringify(data),reason:`approved-contribution:${c.id}`};await client.query('INSERT INTO arcanum_revisions(id,workspace_id,version,author_id,author_name,data,reason) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)',[revision.id,revision.workspace_id,revision.version,revision.author_id,revision.author_name,revision.data,revision.reason]);}
+        const status=approved?'approved':'rejected';const updated=await client.query('UPDATE arcanum_contributions SET status=$1,resolved_at=NOW(),resolved_by=$2 WHERE id=$3 RETURNING id,status,resolved_at AS "resolvedAt",resolved_by AS "resolvedBy"',[status,req.userId,c.id]);await client.query('COMMIT');return res.json({contribution:updated.rows[0],revision});
+      }catch(e){try{await client.query('ROLLBACK');}catch{}throw e;}finally{client.release();}
+    }
+    const db=readFileDb();const c=(db.contributions||[]).find(x=>x.id===req.params.contributionId&&x.workspaceId===req.params.id);if(!c)return res.status(404).json({error:'Không tìm thấy đề xuất'});if(c.status!=='pending')return res.status(409).json({error:'Đề xuất đã được xử lý'});let revision=null;if(approved){const w=db.workspaces.find(x=>x.id===req.params.id);w.version=Number(w.version||0)+1;w.data=cleanData(w.data);w.data.notes.push({id:uid('contrib'),kind:'contribution',entryId:c.entryId,text:c.text,authorId:c.authorId,authorName:c.authorName,color:c.color,approvedAt:new Date().toISOString()});db.revisions=db.revisions||[];revision={id:uid('rev'),workspaceId:w.id,version:w.version,authorId:req.userId,authorName:user.name,data:w.data,reason:`approved-contribution:${c.id}`,createdAt:new Date().toISOString()};db.revisions.push(revision);}c.status=approved?'approved':'rejected';c.resolvedAt=new Date().toISOString();c.resolvedBy=req.userId;writeFileDb(db);res.json({contribution:c,revision});
+  }catch(e){console.error(e);res.status(500).json({error:'Không thể xử lý đề xuất'});}
+});
+
+app.get('/api/workspaces/:id/revisions',auth,async(req,res)=>{try{const m=await member(req.userId,req.params.id);if(!m)return res.status(403).json({error:'Bạn chưa tham gia workspace này'});if(storage==='postgres'){const r=await pool.query('SELECT id,version,author_id AS "authorId",author_name AS "authorName",reason,created_at AS "createdAt" FROM arcanum_revisions WHERE workspace_id=$1 ORDER BY version DESC LIMIT 100',[req.params.id]);return res.json({revisions:r.rows});}const db=readFileDb();res.json({revisions:(db.revisions||[]).filter(x=>x.workspaceId===req.params.id).sort((a,b)=>Number(b.version)-Number(a.version)).slice(0,100)});}catch(e){console.error(e);res.status(500).json({error:'Không thể lấy lịch sử'});}});
+
+app.use((_req,res)=>{const file=path.join(__dirname,'Arcanum_CloudSync.html');if(!fs.existsSync(file))return res.status(404).send('Arcanum UI not found');res.type('html').send(fs.readFileSync(file,'utf8'));});
+
+initStorage().then(()=>app.listen(PORT,'0.0.0.0',()=>console.log(`Arcanum Cloud running on 0.0.0.0:${PORT} storage=${storage}`))).catch(e=>{console.error('Startup failure:',e);process.exit(1);});
