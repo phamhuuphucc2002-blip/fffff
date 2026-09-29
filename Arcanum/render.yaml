@@ -4,7 +4,7 @@ services:
     runtime: node
     rootDir: Arcanum
     plan: free
-    buildCommand: npm install
+    buildCommand: npm install && node patch-export-button.js
     startCommand: npm start
 
     envVars:
