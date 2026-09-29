@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: arcanum-cloud-sync
+    name: arcanum-cloud-live
     runtime: node
     rootDir: Arcanum
     plan: free
@@ -17,7 +17,7 @@ services:
         generateValue: true
 
       - key: CORS_ORIGIN
-        value: https://arcanum-cloud-sync.onrender.com
+        value: https://arcanum-cloud-live.onrender.com
 
       - key: PGSSL
         value: require
