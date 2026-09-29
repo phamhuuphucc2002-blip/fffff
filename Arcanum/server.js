@@ -74,6 +74,11 @@ app.get('/health', async (_req, res) => {
   catch { res.status(503).json({ ok: false }); }
 });
 
+app.get('/api/health', async (_req, res) => {
+  try { await pool.query('SELECT 1'); res.json({ ok: true, time: nowIso(), service: 'arcanum-cloud-live' }); }
+  catch { res.status(503).json({ ok: false, service: 'arcanum-cloud-live' }); }
+});
+
 app.post('/api/auth/register', async (req, res) => {
   try {
     const email = normalizeEmail(req.body.email), password = String(req.body.password || ''), name = String(req.body.name || '').trim().slice(0,100);
