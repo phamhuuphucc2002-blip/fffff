@@ -2,7 +2,6 @@ services:
   - type: web
     name: arcanum-cloud-sync
     runtime: node
-    rootDir: arcanum-cloud-sync
     plan: free
     buildCommand: npm install
     startCommand: npm start
