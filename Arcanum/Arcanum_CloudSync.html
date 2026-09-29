@@ -380,7 +380,8 @@ clearEntry();clearNote();initCats();renderArchive();renderNotes();initTranslatio
   const getSession=()=>{try{return JSON.parse(localStorage.getItem(K.session)||'null')}catch{return null}};
   const setSession=s=>localStorage.setItem(K.session,JSON.stringify(s));
   const clearSession=()=>localStorage.removeItem(K.session);
-  const server=()=>String($('acmServer').value||localStorage.getItem(K.server)||'').trim().replace(/\/$/,'');
+  const DEFAULT_SERVER=(location.origin&&location.origin.startsWith('http')?location.origin:'https://arcanum-cloud-live.onrender.com');
+  const server=()=>String($('acmServer').value||localStorage.getItem(K.server)||DEFAULT_SERVER).trim().replace(/\/$/,'');
   const setServer=v=>{const x=String(v||'').trim().replace(/\/$/,'');$('acmServer').value=x;if(x)localStorage.setItem(K.server,x);};
   const setStatus=(msg,type='idle')=>{$('acmStatus').textContent=msg;btn.dataset.state=type;btn.textContent=type==='busy'?'☁ Đang đồng bộ…':type==='ok'?'☁ Cloud: OK':type==='error'?'☁ Cloud: Lỗi':'☁ Cloud Sync';};
   function currentLocal(){try{const raw=localStorage.getItem('arcanum_standalone_v2');const x=raw?JSON.parse(raw):null;return x&&Array.isArray(x.entries)?{version:3,entries:x.entries,notes:Array.isArray(x.notes)?x.notes:[]}:null}catch{return null}}
@@ -400,7 +401,7 @@ clearEntry();clearNote();initCats();renderArchive();renderNotes();initTranslatio
   function logout(){clearSession();$('acmUserStat').textContent='—';$('acmWsStat').textContent='—';$('acmVerStat').textContent='—';setStatus('Đã đăng xuất.');}
   $('acmClose').onclick=()=>overlay.style.display='none';btn.onclick=()=>{refreshUi();overlay.style.display='flex'};overlay.addEventListener('click',e=>{if(e.target===overlay)overlay.style.display='none'});
   $('acmRegister').onclick=register;$('acmLogin').onclick=login;$('acmMe').onclick=me;$('acmCreateWs').onclick=createWs;$('acmJoinWs').onclick=joinWs;$('acmPull').onclick=pull;$('acmPush').onclick=push;$('acmRefresh').onclick=refresh;$('acmLogout').onclick=logout;
-  $('acmServer').value=localStorage.getItem(K.server)||'';refreshUi();
+  $('acmServer').value=localStorage.getItem(K.server)||DEFAULT_SERVER;refreshUi();
   window.ArcanumCloudSync={pull,push,refresh,status:()=>getSession()};
   const originalSetItem=localStorage.setItem.bind(localStorage);let suppress=false;let timer=null;localStorage.setItem=(key,value)=>{originalSetItem(key,value);if(key==='arcanum_standalone_v2'&&!suppress&&getSession()?.token){clearTimeout(timer);timer=setTimeout(()=>push().catch(()=>{}),1600)}};
   const s=getSession();if(s?.token){setStatus('Đã đăng nhập. Đồng bộ tự động sẽ đẩy hồ sơ dùng chung sau khi bạn lưu.','ok');setInterval(async()=>{try{const ss=getSession();if(!ss?.token||!ss.workspace?.id)return;const r=await api('/api/workspaces/'+encodeURIComponent(ss.workspace.id)+'/data');if(Number(r.version)>Number(ss.workspace.version||0)){setStatus('Có dữ liệu mới trên cloud (v'+r.version+'). Hãy dùng Lấy dữ liệu cloud để cập nhật.','busy');}else{$('acmVerStat').textContent=r.version}}catch{}} ,30000);}
