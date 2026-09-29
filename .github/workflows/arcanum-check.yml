@@ -1,0 +1,27 @@
+name: Arcanum backend check
+
+on:
+  push:
+    paths:
+      - 'Arcanum/**'
+      - '.github/workflows/arcanum-check.yml'
+  pull_request:
+    paths:
+      - 'Arcanum/**'
+      - '.github/workflows/arcanum-check.yml'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Arcanum
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: Arcanum/package-lock.json
+      - run: npm install
+      - run: node --check server.js
