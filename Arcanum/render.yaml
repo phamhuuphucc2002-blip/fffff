@@ -22,6 +22,9 @@ services:
       - key: PGSSL
         value: require
 
+      - key: ALLOW_FILE_STORAGE
+        value: "false"
+
 databases:
   - name: arcanum-db
     plan: free
